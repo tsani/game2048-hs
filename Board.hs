@@ -1,58 +1,87 @@
-module Board ( shiftBoard, putValue, put2, put4, makeBoard, freeSquares, boardToString, possibleMoves, Vec2i(..), Direction(..), Board ) where
+module Board ( makeBoard, boardSize, shiftBoard, boardTranspose,
+               putValue, put2, put4, addBlockIO, 
+               freeSquares, possibleMoves, possibleBoards, possibleMoveResults, possibleMoveResults', chooseFrom, didWin,
+               boardToString, boardFromLists,
+               Vec2i(..), Direction(..), Board, BoardChance ) where
 
-import Prelude hiding ( head, init, tail, last )
-
-import qualified Data.Vector as V
-import qualified Data.List as L
-import Control.Applicative
-import Data.Vector ( (//), update, head, init, tail, last )
+import Data.List
+import System.Random
 
 type Length = Int
 
--- |The first index is the row and the second is the column.
-type Board = V.Vector (V.Vector Int)
+type Tile = Int
+type Row = [Tile]
+type Board = [Row]
+
+type BoardChance = (Board, Double)
 
 data Direction = DirUp | DirDown | DirLeft | DirRight deriving (Eq, Show, Enum)
 
 data Vec2i = Vec2i Int Int deriving (Eq, Show)
 
+didWin :: Board -> Bool
+didWin = any (any (>=2048))
+
+chooseFrom :: [a] -> StdGen -> (StdGen, a)
+chooseFrom xs rng = let (i, rng') = randomR (0, length xs - 1) rng
+                    in (rng', xs !! i)
+
+addBlockIO :: Board -> IO Board
+addBlockIO b = do 
+             rng <- newStdGen
+             let (rng', sq) = chooseFrom (freeSquares b) rng
+             let prob = fst $ random rng' :: Double
+             let putf = if prob <= 0.1 then put4 else put2
+             return $ putf sq b
+
 boardToString :: Board -> String
-boardToString b = unlines $ map (\row -> concatMap (\i -> show i ++ " ") $ V.toList row) $ V.toList b
+boardToString b = unlines $ map (\r -> concatMap (\i -> show i ++ " ") r) b
 
+boardFromLists :: [[Int]] -> Board
+boardFromLists = id -- now that we're using lists...
+
+-- |Write a value into the "Board".
 putValue :: Int -> Vec2i -> Board -> Board
-putValue v (Vec2i row col) b = b // [(row, rowVec // [(col, v)])]
-    where rowVec = b V.! row
+putValue v (Vec2i rx cx) b = iRows ++ (iCols ++ v:fCols) : fRows
+    where (iRows, r':fRows) = splitAt rx b
+          (iCols, _:fCols) = splitAt cx r'
 
+-- |Shorthand for writing the value 2.
 put2 = putValue 2
+
+-- |Shorthand for writing the value 4.
 put4 = putValue 4
 
+prob2 = 0.9
+prob4 = 0.1
+
+-- |Create a square board initialized with zeroes. 
 makeBoard :: Length -> Board
-makeBoard l = V.replicate l $ V.replicate l 0
+makeBoard l = replicate l $ replicate l 0
 
+-- |A 2-vector (rows,cols) representing the size of a Board.
+boardSize :: Board -> Vec2i
+boardSize b = Vec2i (length b) (length $ head b)
+
+-- |Find all the zero tiles on the Board.
 freeSquares :: Board -> [Vec2i]
-freeSquares b = V.ifoldl' (\sqs rowi row -> V.ifoldl' (\sqs coli v -> if v == 0 then (Vec2i rowi coli):sqs else sqs) sqs row) [] b
+freeSquares b = foldl' (\sqs (rowi, row) -> foldl' (\sqs (coli, v) -> if v == 0 then (Vec2i rowi coli):sqs else sqs) sqs row) [] b'
+    where b' = enumerate $ map enumerate $ b
+          enumerate = zip [0..]
 
--- |Starts at the end of the Vector and pulls elements to the right.
-pullRight :: V.Vector Int -> V.Vector Int
-pullRight v
-    | V.all (==0) v             = v -- empty row !
-    | (V.null . init) v         = v -- nothing left to pull !
-    | last v == 0               = pullRight $ v // ((0,0) : zip [1..] (V.toList $ V.init v))
-    | last v == (last . init) v = (pullRight $ V.init $ v // [(V.length v - 2, 0)]) `V.snoc` (V.last v * 2)
-    | otherwise                 = (pullRight $ V.init v) `V.snoc` (V.last v)
+pullLeft :: [Int] -> [Int]
+pullLeft [] = []
+pullLeft ns
+    | isEmpty ns = ns
+    | (null . tail) ns = ns
+    | this == 0 = pullLeft $ nexts ++ [0]
+    | next == 0 && (not . isEmpty) nexts = pullLeft $ this : pullLeft nexts
+    | this == next = pullLeft $ (this * 2):0:tail nexts
+    | otherwise = this : pullLeft nexts
+    where isEmpty = all (== 0)
+          this : nexts@(next : _) = ns
 
-pullLeft = V.reverse . pullRight . V.reverse
-
--- |Shift all blocks on the given "Board" in the specified "Direction".
--- If the shift produced no movement, then "Nothing" is yielded.
---shiftBoard :: Direction -> Board -> Board
---shiftBoard d = shiftf d'
---    where boardTranspose = V.fromList . map V.fromList . L.transpose . V.toList . V.map V.toList
---          verticalShift d = boardTranspose . shiftBoard d . boardTranspose
---          d' = if d == DirUp then DirLeft else if d == DirDown then DirRight else d
---          shiftf = if d == DirLeft || d == DirRight then (V.map . pull) else verticalShift
---          pull DirRight = pullRight
---          pull DirLeft = pullLeft
+pullRight = reverse . pullLeft . reverse
 
 possibleMoves :: Board -> [(Direction, Board)]
 possibleMoves b = map (\(d, Just b) -> (d, b)) $ 
@@ -61,15 +90,32 @@ possibleMoves b = map (\(d, Just b) -> (d, b)) $
                                          Nothing -> False
                            ) $ map (\d -> (d, shiftBoard d b)) $ enumFrom DirUp
 
+-- |Yields a list of all the possible boards that can be made by placing a 2 or 4 on an empty tile 
+-- alongside the associated probability of that board being picked.
+possibleBoards :: Board -> [BoardChance]
+possibleBoards b = concatMap (\sq -> [(put2 sq b, prob2/n),(put4 sq b, prob4/n)]) fsqs
+    where fsqs = freeSquares b
+          n = fromIntegral $ length fsqs
+
+possibleMoveResults :: Board -> [(Direction, Board, [(Board, Double)])]
+possibleMoveResults bi = map (\(d, b) -> (d, b, map (fmap (/n)) (possibleBoards b))) pmb
+    where pmb = possibleMoves bi
+          n = fromIntegral $ length pmb
+
+possibleMoveResults' :: Board -> [(Board, [(Board, Double)])]
+possibleMoveResults' = map (\(_, b, bps) -> (b, bps)) . possibleMoveResults
+
+boardTranspose :: Board -> Board
+boardTranspose = transpose
+
 shiftBoard :: Direction -> Board -> Maybe Board
 shiftBoard d b = shiftf d' b
-    where boardTranspose = V.fromList . map V.fromList . L.transpose . V.toList . V.map V.toList
-          verticalShift d = fmap boardTranspose . shiftBoard d . boardTranspose
+    where verticalShift d = fmap boardTranspose . shiftBoard d . boardTranspose
           d' = if d == DirUp then DirLeft else if d == DirDown then DirRight else d
 
           shiftf :: Direction -> Board -> Maybe Board
           shiftf d' b = if d == DirLeft || d == DirRight 
-                        then let b' = V.map (pull d') b in if b' == b then Nothing else Just b'
+                        then let b' = map (pull d') b in if b' == b then Nothing else Just b'
                         else verticalShift d' b
           pull DirRight = pullRight
           pull DirLeft = pullLeft
